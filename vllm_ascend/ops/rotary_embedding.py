@@ -16,6 +16,7 @@
 #
 
 import math
+import os
 from typing import Optional, Tuple
 
 import einops
@@ -25,10 +26,14 @@ from vllm.model_executor.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding, MRotaryEmbedding, RotaryEmbedding,
     YaRNScalingRotaryEmbedding)
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
+from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import (AscendDeviceType, enable_custom_op,
                                get_ascend_device_type, has_rope, is_vl_model)
+
+if HAS_TRITON:
+    from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
 
 # Currently, rope ops used on npu requires detached cos && sin as inputs.
 # However, RotaryEmbedding in vllm use cos_sin_cache as a whole variable.
@@ -513,6 +518,49 @@ class AscendDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
 
 
 class AscendMRotaryEmbedding(MRotaryEmbedding):
+    # Empirical safety threshold for large Triton grids on Ascend NPU
+    _ASCEND_TRITON_GRID_LIMIT = 65535
+
+    def forward_triton(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ):
+        assert positions.ndim == 2
+        assert key is not None
+
+        self._match_cos_sin_cache_dtype(query)
+        self.cos = None
+        self.sin = None
+        if self.cos is None and self.sin is None:
+            cos_sin = self.cos_sin_cache[positions]  # type: ignore
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            self.cos = cos.contiguous()
+            self.sin = sin.contiguous()
+        query_shape = query.shape
+        key_shape = key.shape
+
+        assert self.mrope_section
+
+        # When the grid becomes large, enable TRITON_ALL_BLOCKS_PARALLEL
+        # to avoid scheduler/runtime failures.
+        if query_shape[0] > self._ASCEND_TRITON_GRID_LIMIT and \
+                os.environ.get("TRITON_ALL_BLOCKS_PARALLEL") != "1":
+            os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = "1"
+
+        q, k = triton_mrope(
+            query,
+            key,
+            self.cos,
+            self.sin,
+            self.mrope_section,
+            self.head_size,
+            self.rotary_dim,
+            self.mrope_interleaved,
+        )
+
+        return q.reshape(query_shape), k.reshape(key_shape)
 
     def forward_oot(
         self,
@@ -520,6 +568,10 @@ class AscendMRotaryEmbedding(MRotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor,
     ):
+        if HAS_TRITON and positions.ndim == 2 and self.mrope_interleaved:
+            # todo: need cann update in 8.5.0
+            return self.forward_triton(positions, query, key)
+
         if self.mrope_section != [16, 24, 24]:
             return super().forward_oot(positions, query, key)
 
