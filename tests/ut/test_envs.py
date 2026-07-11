@@ -35,10 +35,11 @@ class TestEnvVariables(TestBase):
                     self.assertEqual(getattr(envs_ascend, var_name), var_handler())
 
                     handler_source = inspect.getsource(var_handler)
-                    if "int(" in handler_source:
-                        test_vals = ["123", "456"]
-                    elif "bool(int(" in handler_source:
+                    compact_source = "".join(handler_source.split())
+                    if "bool(int(" in compact_source:
                         test_vals = ["0", "1"]
+                    elif "int(" in compact_source:
+                        test_vals = ["123", "456"]
                     else:
                         test_vals = [f"test_{var_name}", f"custom_{var_name}"]
 
@@ -57,3 +58,18 @@ class TestEnvVariables(TestBase):
         for var_name in self.env_vars:
             with self.subTest(var=var_name):
                 getattr(envs_ascend, var_name)
+
+    def test_vit_triton_fa_is_opt_in(self):
+        name = "VLLM_ASCEND_ENABLE_VIT_TRITON_FA"
+        original_val = os.environ.pop(name, None)
+        try:
+            self.assertFalse(getattr(envs_ascend, name))
+            os.environ[name] = "1"
+            self.assertTrue(getattr(envs_ascend, name))
+            os.environ[name] = "0"
+            self.assertFalse(getattr(envs_ascend, name))
+        finally:
+            if original_val is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = original_val

@@ -344,21 +344,29 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
                 padding_logic = self.config.padding_logics.get(key, self._copy_padded_buffer)
                 padding_logic(buf, src)
 
-        cu_seqlens = graph_meta.input_buffers.get("cu_seqlens")
-        cu_seqlens_cpu = None if cu_seqlens is None else cu_seqlens.cpu()
-
+        # Triton attention reads cu_seqlens directly from the replay input
+        # buffer, so a graph containing no FIA task handles needs neither the
+        # metadata D2H copies nor the host-side graph_task_update stream.
+        params = get_encoder_graph_params()
+        needs_fia_update = params is not None and bool(params.handles.get(token_budget))
+        cu_seqlens_cpu = None
         update_stream = self.update_stream
-        if update_stream is None:
-            update_stream = torch.npu.Stream()
+        if needs_fia_update:
+            cu_seqlens = graph_meta.input_buffers.get("cu_seqlens")
+            cu_seqlens_cpu = None if cu_seqlens is None else cu_seqlens.cpu()
+            if update_stream is None:
+                update_stream = torch.npu.Stream()
 
         graph_meta.graph.replay()
 
-        with set_encoder_forward_context(
-            token_budget,
-            False,
-            cu_seqlens_cpu=cu_seqlens_cpu,
-        ):
-            update_encoder_graph_params(update_stream, token_budget)
+        if needs_fia_update:
+            assert update_stream is not None
+            with set_encoder_forward_context(
+                token_budget,
+                False,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+            ):
+                update_encoder_graph_params(update_stream, token_budget)
 
         self.graph_hits += num_items
         return graph_meta.output_buffer

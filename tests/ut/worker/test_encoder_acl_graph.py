@@ -184,3 +184,86 @@ def test_capture_budget_graph_npu():
     graph_meta = mgr._get_graph_set("default")[2048]
     assert graph_meta.graph is fake_graph
     assert graph_meta.input_buffers is capture_values
+
+
+def _make_replay_manager(events, token_budget=512):
+    src = SimpleNamespace(ndim=1)
+    metadata = MagicMock()
+    metadata.copy_.side_effect = lambda _src: events.append("copy")
+    graph = MagicMock()
+    graph.replay.side_effect = lambda: events.append("replay")
+    output = object()
+    graph_meta = SimpleNamespace(
+        input_buffers={"cu_seqlens": metadata},
+        graph=graph,
+        output_buffer=output,
+    )
+
+    model = MagicMock()
+    model.prepare_encoder_cudagraph_replay_buffers.return_value = SimpleNamespace(
+        values={"cu_seqlens": src}
+    )
+    manager = SimpleNamespace(
+        _get_item_specs=lambda _kwargs: [object()],
+        _get_graph_set=lambda _path: {token_budget: graph_meta},
+        graph_misses=0,
+        graph_hits=0,
+        model=model,
+        max_batch_size=4,
+        max_frames_per_batch=1,
+        config=SimpleNamespace(
+            buffer_keys=("cu_seqlens",),
+            padding_logics={"cu_seqlens": lambda buf, value: buf.copy_(value)},
+        ),
+        _copy_padded_buffer=lambda buf, value: buf.copy_(value),
+        update_stream=None,
+    )
+    return manager, metadata, output
+
+
+def test_triton_only_graph_replay_skips_host_metadata_and_fia_update():
+    events = []
+    manager, metadata, output = _make_replay_manager(events)
+    metadata.cpu.side_effect = AssertionError("Triton-only replay must not copy metadata to host")
+    params = SimpleNamespace(handles={512: []})
+
+    with (
+        patch("vllm_ascend.worker.encoder_acl_graph.get_encoder_graph_params", return_value=params),
+        patch("vllm_ascend.worker.encoder_acl_graph.torch.npu.Stream") as stream,
+        patch("vllm_ascend.worker.encoder_acl_graph.update_encoder_graph_params") as update,
+    ):
+        result = EncoderAclGraphManager._run_budget_graph(manager, {}, 512)
+
+    assert result is output
+    assert events == ["copy", "replay"]
+    stream.assert_not_called()
+    update.assert_not_called()
+    assert manager.graph_hits == 1
+
+
+def test_fia_graph_replay_preserves_host_metadata_update():
+    events = []
+    manager, metadata, output = _make_replay_manager(events)
+    host_metadata = object()
+
+    def copy_to_host():
+        events.append("cpu")
+        return host_metadata
+
+    metadata.cpu.side_effect = copy_to_host
+    params = SimpleNamespace(handles={512: [object()]})
+    update_stream = object()
+
+    with (
+        patch("vllm_ascend.worker.encoder_acl_graph.get_encoder_graph_params", return_value=params),
+        patch("vllm_ascend.worker.encoder_acl_graph.torch.npu.Stream", return_value=update_stream) as stream,
+        patch("vllm_ascend.worker.encoder_acl_graph.update_encoder_graph_params") as update,
+    ):
+        update.side_effect = lambda *_args, **_kwargs: events.append("update")
+        result = EncoderAclGraphManager._run_budget_graph(manager, {}, 512)
+
+    assert result is output
+    assert events == ["copy", "cpu", "replay", "update"]
+    stream.assert_called_once_with()
+    update.assert_called_once_with(update_stream, 512)
+    assert manager.graph_hits == 1

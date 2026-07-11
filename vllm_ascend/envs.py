@@ -99,6 +99,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Opt-in Triton flash-attention path for vision encoder head_dim that FIA
+    # does not support natively (e.g. Qwen3.5-VL head_dim=72). Both eager and
+    # ACL-graph paths run at native head_dim instead of FIA pad-to-128 when the
+    # invocation is supported. Keep disabled by default until NPU coverage has
+    # validated the new kernel; set "1" to enable it.
+    "VLLM_ASCEND_ENABLE_VIT_TRITON_FA": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_VIT_TRITON_FA", "0"))
+    ),
 }
 
 # end-env-vars-definition
